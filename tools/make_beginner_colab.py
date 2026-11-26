@@ -408,7 +408,7 @@ plt.show()
 print(f'First loss: {losses[0]:.3f}   Last loss: {losses[-1]:.3f}')
 """))
     cells.append(m(r"""
-The loss drops steeply in the first 1,000 steps, then flattens around 0.4. It does not reach 0 because one question has many valid answers in the data ("are you hungry" has dozens of different replies), so the model cannot predict the exact next word every time. It only needs to give good odds to each valid one.
+The loss drops steeply in the first 1,000 steps, then flattens around 0.4. It does not reach 0 most likely because the same kind of question has many different valid replies in the data, so the model cannot predict the exact next word every time. It only needs to give good odds to each valid one.
 """))
 
     # ── 8. Generation ───────────────────────────────────────────────────
