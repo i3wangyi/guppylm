@@ -80,10 +80,10 @@ else:
     cells.append(m(r"""
 ## 2. The source files
 
-These are the real GuppyLM files. `config.py`, `model.py`, `dataset.py` and `train.py` are the same ones the first notebook used (`dataset.py` and `train.py` are only needed here because `stages.py` borrows `get_lr` from `train.py`).
+These are the real GuppyLM files. `config.py`, `model.py`, `train.py` and `inference.py` are the same ones the first notebook used. `dataset.py` is only needed here because `train.py` imports it (and `stages.py` borrows `get_lr` from `train.py`).
 The new file is **`stages.py`**. It holds everything the stages share: a packed-text dataset, loss functions, and one training loop that every stage reuses. Read its top comment first.
 """))
-    for name in ["config.py", "model.py", "dataset.py", "train.py", "stages.py"]:
+    for name in ["config.py", "model.py", "dataset.py", "train.py", "stages.py", "inference.py"]:
         cells.append(code(f"%%writefile {name}\n" + src(name)))
 
     # ── 3. Data ─────────────────────────────────────────────────────────
@@ -340,6 +340,9 @@ plt.plot(smooth(sft_losses), label='average of last 50 steps')
 plt.xlabel('step'); plt.ylabel('answer loss'); plt.legend(); plt.title('Stage 1: SFT loss')
 plt.show()
 print(f'Answer loss on the evaluation set:  before SFT {before:.3f}  ->  after SFT {sft_best:.3f}')
+"""))
+    cells.append(m(r"""
+Compare the two numbers: the answer loss on the held-out conversations before and after SFT. Then look at the `Eval` column in the training table above. If it was still falling at the last row, the model had not finished learning, and more steps would help.
 """))
     cells.append(m(r"""
 ## 9. Pretrained versus SFT: same questions, two models
