@@ -229,7 +229,7 @@ tokenizer.save('data/tokenizer.json')
 print(f'Vocabulary size: {tokenizer.get_vocab_size()}')
 """))
     cells.append(m(r"""
-**Why is the vocabulary smaller than 4,096?** The fish only talks about a few hundred words. The trainer stops merging when no pair of pieces appears at least twice, so it ends with fewer tokens than the limit. The model still allocates 4,096 slots, and the unused ones just stay untrained. That is why the loss check in step 5 uses 4,096.
+**Why is the vocabulary smaller than 4,096?** The fish uses a small, repetitive set of words. The trainer stops merging when no pair of pieces appears at least twice, so it ends with fewer tokens than the limit. The model still allocates 4,096 slots, and the unused ones just stay untrained. That is why the loss check in step 5 uses 4,096.
 
 Now play with it. Change the sentence and run the cell again. Words the fish knows well (water, food) become one token. Words it has never seen, like "quantum", split into smaller pieces.
 The `Ġ` you see at the start of a token is how this tokenizer writes a leading space, so `Ġlove` means " love".
