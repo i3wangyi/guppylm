@@ -4,7 +4,7 @@ Every stage uses the same model and the same training loop (train_stage). What c
 stage to stage is the DATA and the LOSS FUNCTION:
 
   Stage 0  pretraining  plain text, predict the next token everywhere      (this file, below)
-  Stage 1  SFT          chat text, predict the next token in answers only  (added later)
+  Stage 1  SFT          chat text, predict the next token in answers only  (below)
   Stage 2  DPO          pairs of good and bad answers                      (added later)
 """
 
@@ -14,6 +14,7 @@ import random
 import time
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tokenizers import Tokenizer
 
@@ -91,6 +92,76 @@ def lm_loss(model, batch):
     x, y = batch
     _, loss = model(x, y)
     return loss
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STAGE 1: SFT (SUPERVISED FINE-TUNING)
+# ══════════════════════════════════════════════════════════════════════════════
+
+IGNORE = -100   # PyTorch's cross_entropy skips every target equal to this value (its default ignore_index)
+
+
+class SFTDataset(Dataset):
+    r"""Chat examples where the loss counts ONLY the assistant's answer.
+
+    Each example is the same ChatML text as before. The difference is in the targets:
+
+      prompt part (targets are -100, no loss):  <|im_start|> user \n are you hungry <|im_end|> \n <|im_start|> assistant \n
+      answer part (targets are real tokens):    yes . always yes . <|im_end|>
+
+    We do not teach the model to write the prompt. We only teach it to write the answer.
+    The final <|im_end|> is part of the answer, so the model also learns WHEN to stop.
+    """
+
+    def __init__(self, pairs, tokenizer_path, max_len=128):
+        # pairs: a list of (user_text, reply_text)
+        tokenizer = Tokenizer.from_file(tokenizer_path)
+        self.samples = []
+        for user_text, reply_text in pairs:
+            # Prompt and answer are encoded separately and joined. That is exactly what happens at chat time:
+            # the prompt is encoded, then the model writes the answer token by token.
+            prompt_ids = tokenizer.encode(f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n").ids
+            reply_ids = tokenizer.encode(f"{reply_text}<|im_end|>").ids
+            ids = (prompt_ids + reply_ids)[:max_len]
+            x, y = ids[:-1], ids[1:]                  # same one-token shift as always
+            # y[i] is the token that follows x[i]. The answer starts at ids[len(prompt_ids)], which is y[len(prompt_ids) - 1].
+            n_masked = len(prompt_ids) - 1
+            if n_masked >= len(y):
+                continue                              # the answer was cut off completely: nothing to learn from
+            self.samples.append((x, [IGNORE] * n_masked + y[n_masked:]))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        x, y = self.samples[i]
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+
+
+def sft_collate(batch):
+    # Pad every example to the longest one in the batch. Inputs are padded with <pad> (id 0),
+    # targets with IGNORE, so padding never counts in the loss. Because attention is causal,
+    # padding at the END cannot change the results for the real tokens before it.
+    xs, ys = zip(*batch)
+    longest = max(len(x) for x in xs)
+    padded_x = torch.zeros((len(xs), longest), dtype=torch.long)
+    padded_y = torch.full((len(ys), longest), IGNORE, dtype=torch.long)
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        padded_x[i, :len(x)] = x
+        padded_y[i, :len(y)] = y
+    return padded_x, padded_y
+
+
+def get_sft_loader(pairs, tokenizer_path, max_len=128, batch_size=32, shuffle=True):
+    dataset = SFTDataset(pairs, tokenizer_path, max_len)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=sft_collate, drop_last=shuffle)
+
+
+def sft_loss(model, batch):
+    """Next-token loss over the answer tokens only (the targets that are not IGNORE)."""
+    x, y = batch
+    logits, _ = model(x)                              # no targets passed: we compute the loss ourselves, with the mask
+    return F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=IGNORE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

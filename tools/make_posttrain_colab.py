@@ -37,7 +37,7 @@ The first GuppyLM notebook trained a model in one go. Real chat models go throug
 | Stage | Data | What the model learns | Status in this notebook |
 |---|---|---|---|
 | 0. Pretraining | Plain text, no chat format | The language itself: which words follow which | Done below |
-| 1. SFT (supervised fine-tuning) | Chat conversations | To answer when asked (loss only on the answer) | Coming next |
+| 1. SFT (supervised fine-tuning) | Chat conversations | To answer when asked (loss only on the answer) | Done below |
 | 2. DPO (direct preference optimization) | Pairs of a good and a bad answer | To prefer the good one | Coming after SFT |
 
 You will chat with the model after every stage, so you can see what each one adds.
@@ -54,8 +54,13 @@ You will chat with the model after every stage, so you can see what each one add
     cells.append(c(r"""
 !pip install -q tokenizers datasets
 
-import os, shutil, time, json, random
+import os, sys, shutil, time, json, random
 import torch
+
+# If you run this notebook a second time in the same session, Python would keep the OLD copies of our
+# modules in memory. Forget them, so the files written below are imported fresh.
+for name in ['config', 'model', 'dataset', 'train', 'stages', 'inference']:
+    sys.modules.pop(name, None)
 
 # Start from an empty folder so old files from earlier runs cannot confuse us.
 if os.path.exists('/content/guppy'):
@@ -263,6 +268,127 @@ for _ in range(3):
 The chat-format question is a different story. The model has not been taught to answer. In stage 1 (SFT) it will be.
 
 **Where we are.** The pretrained weights are saved in `checkpoints/pretrain/best.pt`. Stage 1 starts from this file instead of from random weights. That is the key idea: **each stage starts where the previous one stopped**.
+"""))
+
+    # ── 8. Stage 1: SFT ─────────────────────────────────────────────────
+    cells.append(m(r"""
+## 8. Stage 1: SFT (supervised fine-tuning)
+
+Now we teach the model to **answer**. We use real question-and-answer conversations in chat format, and we start from the pretrained weights instead of from scratch.
+
+One idea makes SFT different from pretraining: the **loss mask**. The model reads the whole conversation, but we only compute the loss on the assistant's answer. The user's question is context, not something the model should learn to write.
+PyTorch has a built-in way to do this: any target equal to `-100` is skipped by `cross_entropy`.
+
+The final `<|im_end|>` counts as part of the answer, so the model also learns **when to stop**.
+
+First we build the (question, answer) pairs. The HuggingFace test split (3,000 conversations) becomes our evaluation set.
+"""))
+    cells.append(c(r"""
+from stages import SFTDataset, get_sft_loader, sft_loss, IGNORE
+
+train_pairs = [(r['input'], r['output']) for r in ds['train']]
+eval_pairs = [(r['input'], r['output']) for r in ds['test']]
+print(f'{len(train_pairs):,} training pairs, {len(eval_pairs):,} evaluation pairs')
+
+# Look at one example: which tokens will the loss count?
+sample = SFTDataset(train_pairs[:1], 'data/tokenizer.json')
+x, y = sample[0]
+print(f'\n{"input token":>16}   {"target"}')
+for tok_id, target in list(zip(x.tolist(), y.tolist()))[:40]:
+    shown = tokenizer.decode([tok_id], skip_special_tokens=False).replace('\n', '\\n')
+    goal = 'masked (no loss)' if target == IGNORE else repr(tokenizer.decode([target], skip_special_tokens=False))
+    print(f'{shown!r:>16}   {goal}')
+"""))
+    cells.append(m(r"""
+Read the table from top to bottom. While the input is still the user's question, the target is masked. Once the input reaches `assistant` and the newline after it, the targets become the answer tokens, one step ahead of the input.
+
+Before we train, let's measure the **answer loss** of the pretrained model on the evaluation conversations: how surprised is it by the real answers when it is given the question in chat format? We will measure again after SFT.
+"""))
+    cells.append(c(r"""
+from stages import evaluate_stage
+
+sft_train_loader = get_sft_loader(train_pairs, 'data/tokenizer.json', batch_size=32, shuffle=True)
+sft_eval_loader = get_sft_loader(eval_pairs, 'data/tokenizer.json', batch_size=32, shuffle=False)
+print(f'{len(sft_train_loader)} training batches per epoch, {len(sft_eval_loader)} evaluation batches')
+
+# Start from the pretrained checkpoint (the best one from stage 0).
+sft_model = GuppyLM(config).to(device)
+sft_model.load_state_dict(torch.load('checkpoints/pretrain/best.pt', map_location=device, weights_only=False)['model_state_dict'])
+
+before = evaluate_stage(sft_model, sft_eval_loader, sft_loss, device, max_batches=100)
+print(f'Answer loss BEFORE SFT: {before:.3f}   (random guessing would be {torch.log(torch.tensor(4096.0)).item():.3f})')
+"""))
+    cells.append(m(r"""
+Now train. Two settings differ from stage 0:
+
+- **A lower learning rate (1e-4 instead of 3e-4).** The model already knows the language. We want to adjust it, not overwrite what it learned.
+- **Fewer steps.** 1,500 steps of 32 conversations is less than one pass over the 57,000 training pairs, so overfitting is not a worry this time.
+"""))
+    cells.append(c(r"""
+t0 = time.time()
+sft_losses, sft_best = train_stage(
+    sft_model, sft_train_loader, sft_eval_loader, sft_loss, device,
+    save_path='checkpoints/sft/best.pt',
+    max_steps=1500, learning_rate=1e-4, min_lr=1e-5, warmup_steps=50, eval_interval=100,
+)
+print(f'Total wall time: {time.time() - t0:.0f} s')
+"""))
+    cells.append(c(r"""
+plt.figure(figsize=(7, 3.5))
+plt.plot(sft_losses, alpha=0.25, label='per step')
+plt.plot(smooth(sft_losses), label='average of last 50 steps')
+plt.xlabel('step'); plt.ylabel('answer loss'); plt.legend(); plt.title('Stage 1: SFT loss')
+plt.show()
+print(f'Answer loss on the evaluation set:  before SFT {before:.3f}  ->  after SFT {sft_best:.3f}')
+"""))
+    cells.append(m(r"""
+## 9. Pretrained versus SFT: same questions, two models
+
+We load both saved checkpoints with the same inference code and ask them the same questions in chat format.
+"""))
+    cells.append(c(r"""
+from inference import GuppyInference
+
+engines = {
+    '0 pretrained': GuppyInference('checkpoints/pretrain/best.pt', 'data/tokenizer.json', device=str(device)),
+    '1 SFT':        GuppyInference('checkpoints/sft/best.pt', 'data/tokenizer.json', device=str(device)),
+}
+
+def reply(engine, text, temperature=0.7):
+    r = engine.chat_completion([{'role': 'user', 'content': text}], temperature=temperature, max_tokens=64)
+    return r['choices'][0]['message']['content']
+
+torch.manual_seed(1)
+for q in ['hi guppy', 'are you hungry', 'do you like bubbles', 'what is the meaning of life', 'tell me a joke', 'goodnight guppy']:
+    print(f'You> {q}')
+    for name, engine in engines.items():
+        print(f'   {name:>13}: {reply(engine, q)!r}')
+    print()
+"""))
+    cells.append(m(r"""
+### Chat with either stage
+
+Pick a stage in the dropdown, type a message, and press **Enter**. Switch back and forth to feel the difference between the stages.
+"""))
+    cells.append(c(r"""
+import ipywidgets as widgets
+from IPython.display import display
+
+stage_menu = widgets.Dropdown(options=list(engines), value='1 SFT', description='stage', style={'description_width': 'initial'})
+box = widgets.Text(placeholder='say something to Guppy, then press Enter', layout=widgets.Layout(width='520px'))
+log = widgets.Output()
+
+def on_send(_):
+    text = box.value.strip()
+    if not text:
+        return
+    box.value = ''
+    with log:
+        print(f'You>   {text}')
+        print(f'Guppy ({stage_menu.value}) > {reply(engines[stage_menu.value], text)}\n')
+
+box.on_submit(on_send)
+display(stage_menu, box, log)
 """))
 
     # ── Tests ───────────────────────────────────────────────────────────

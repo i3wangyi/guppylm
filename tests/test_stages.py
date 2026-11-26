@@ -14,8 +14,11 @@ from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers
 from guppylm.config import GuppyConfig
 from guppylm.inference import GuppyInference
 from guppylm.model import GuppyLM
+import torch.nn.functional as F
+
 from guppylm.stages import (
-    PackedDataset, get_pretrain_loader, lm_loss, train_stage, write_pretrain_corpus,
+    IGNORE, PackedDataset, SFTDataset, get_pretrain_loader, get_sft_loader, lm_loss, sft_collate, sft_loss,
+    train_stage, write_pretrain_corpus,
 )
 
 SENTENCES = [f"the water is {w} today" for w in ["warm", "cold", "clear", "cloudy", "green", "still"]] * 40 + \
@@ -105,6 +108,75 @@ class StagesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             train_stage(GuppyLM(cfg), too_big, too_big, lm_loss, torch.device("cpu"),
                         os.path.join(self.dir.name, "never.pt"), max_steps=5)
+
+
+PAIRS = [(f"what is the {w}", f"the {w} is here today") for w in ["rock", "plant", "snail", "log", "bubble", "flake"]] * 4
+
+
+class SFTTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.TemporaryDirectory()
+        cls.tok_path = os.path.join(cls.dir.name, "tokenizer.json")
+        make_tokenizer(cls.tok_path)
+        cls.tok = Tokenizer.from_file(cls.tok_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def test_only_the_answer_has_targets(self):
+        ds = SFTDataset(PAIRS, self.tok_path, max_len=64)
+        user, reply = PAIRS[0]
+        prompt_ids = self.tok.encode(f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n").ids
+        reply_ids = self.tok.encode(f"{reply}<|im_end|>").ids
+        x, y = ds[0]
+        n = len(prompt_ids) - 1
+        self.assertEqual(x[0].item(), 1)                                    # starts with <|im_start|>
+        self.assertTrue(torch.all(y[:n] == IGNORE))                         # prompt positions: no loss
+        self.assertEqual(y[n:].tolist(), reply_ids)                         # answer positions: the answer tokens
+        self.assertEqual(y[-1].item(), 2)                                   # the answer ends with <|im_end|>
+        self.assertEqual(len(x), len(y))
+
+    def test_collate_pads_inputs_with_zero_and_targets_with_ignore(self):
+        ds = SFTDataset([("a b c d e f", "x"), ("a", "x y z w v u t")], self.tok_path, max_len=64)
+        px, py = sft_collate([ds[0], ds[1]])
+        self.assertEqual(px.shape, py.shape)
+        short = 0 if len(ds[0][0]) < len(ds[1][0]) else 1
+        n = len(ds[short][0])
+        self.assertTrue(torch.all(px[short, n:] == 0))
+        self.assertTrue(torch.all(py[short, n:] == IGNORE))
+
+    def test_loss_counts_answer_tokens_only(self):
+        torch.manual_seed(0)
+        cfg = GuppyConfig(vocab_size=200, max_seq_len=64, d_model=32, n_layers=1, n_heads=2, ffn_hidden=64, dropout=0.0)
+        model = GuppyLM(cfg).eval()
+        batch = sft_collate([SFTDataset(PAIRS, self.tok_path, 64)[i] for i in range(3)])
+        with torch.no_grad():
+            got = sft_loss(model, batch).item()
+            logits, _ = model(batch[0])
+            keep = batch[1] != IGNORE
+            want = F.cross_entropy(logits[keep], batch[1][keep]).item()      # hand-picked answer positions only
+            all_tokens = F.cross_entropy(logits.view(-1, 200), torch.where(keep, batch[1], batch[0]).view(-1)).item()
+        self.assertAlmostEqual(got, want, places=5)
+        self.assertNotAlmostEqual(got, all_tokens, places=3)                # masking really changes the number
+
+    def test_answer_cut_off_by_max_len_is_skipped(self):
+        ds = SFTDataset([("a " * 40, "short answer")], self.tok_path, max_len=10)
+        self.assertEqual(len(ds), 0)
+
+    def test_sft_training_lowers_loss(self):
+        torch.manual_seed(0)
+        cfg = GuppyConfig(vocab_size=200, max_seq_len=64, d_model=32, n_layers=2, n_heads=2, ffn_hidden=64, dropout=0.0)
+        model = GuppyLM(cfg)
+        loader = get_sft_loader(PAIRS, self.tok_path, 64, batch_size=4)
+        eval_loader = get_sft_loader(PAIRS, self.tok_path, 64, batch_size=4, shuffle=False)
+        with torch.no_grad():
+            first = sft_loss(model, [t for t in next(iter(loader))]).item()
+        losses, _ = train_stage(model, loader, eval_loader, sft_loss, torch.device("cpu"),
+                                os.path.join(self.dir.name, "sft.pt"), max_steps=60, learning_rate=3e-3,
+                                warmup_steps=5, eval_interval=20, log_every=20)
+        self.assertLess(sum(losses[-10:]) / 10, first - 1.0)
 
 
 if __name__ == "__main__":
