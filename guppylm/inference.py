@@ -17,6 +17,8 @@ class GuppyInference:
         self.device = torch.device(device)
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
 
+        # A checkpoint is a pickled Python dict saved by train.py. map_location puts the tensors on our device.
+        # weights_only=False allows non-tensor data (the config dict) inside, so only load files you trust.
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         # Load config.json from same directory as the model file
@@ -24,16 +26,19 @@ class GuppyInference:
         config_path = os.path.join(config_dir, "config.json")
 
         # Extract state_dict — handle both legacy and standard formats
+        # (a state_dict maps each layer name to its weight tensor)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             state_dict = ckpt["model_state_dict"]
         else:
             state_dict = ckpt
 
         # Load config — try config.json first, fall back to embedded config
+        # We must rebuild a model of exactly the same shape as the one that was trained, or loading fails.
         if os.path.exists(config_path):
             with open(config_path) as f:
                 cfg = json.load(f)
             # Support both HF standard keys and our own keys
+            # (cfg.get(a, cfg.get(b, default)) means: try key a, then key b, then the default)
             self.config = GuppyConfig(
                 vocab_size=cfg.get("vocab_size", 4096),
                 max_seq_len=cfg.get("max_position_embeddings", cfg.get("max_seq_len", 128)),
@@ -47,16 +52,18 @@ class GuppyInference:
                 eos_id=cfg.get("eos_token_id", cfg.get("eos_id", 2)),
             )
         elif isinstance(ckpt, dict) and "config" in ckpt:
+            # Keep only keys that GuppyConfig actually has, in case the file holds extra ones.
             valid_fields = {f.name for f in GuppyConfig.__dataclass_fields__.values()}
             self.config = GuppyConfig(**{k: v for k, v in ckpt["config"].items() if k in valid_fields})
         else:
             print("Warning: No config found, using defaults")
             self.config = GuppyConfig()
 
+        # Build an empty model, then copy the trained weights into it.
         self.model = GuppyLM(self.config).to(self.device)
         filtered = {k: v for k, v in state_dict.items() if k in self.model.state_dict()}
         self.model.load_state_dict(filtered)
-        self.model.eval()
+        self.model.eval()   # inference mode: dropout off
 
         total, _ = self.model.param_count()
         print(f"GuppyLM loaded: {total/1e6:.1f}M params")
@@ -64,11 +71,14 @@ class GuppyInference:
     def chat_completion(self, messages, temperature=0.7, max_tokens=64,
                         top_k=50, **kwargs):
         """Chat completion — takes messages, returns response."""
+        # Same steps as the training data: text -> ChatML prompt -> token ids.
         prompt = self._format_prompt(messages)
         input_ids = self.tokenizer.encode(prompt).ids
         prompt_tokens = len(input_ids)
+        # The extra [ ] adds the batch dimension: shape (1, T).
         input_t = torch.tensor([input_ids], dtype=torch.long, device=self.device)
 
+        # generate() returns the prompt plus the new tokens. We slice off the prompt part with [prompt_tokens:].
         output_t, _ = self.model.generate(input_t, max_tokens, temperature, top_k)
         output_text = self.tokenizer.decode(output_t[0].tolist()[prompt_tokens:])
         # Truncate at first <|im_end|> — don't let the model leak into the next turn
@@ -79,6 +89,7 @@ class GuppyInference:
             output_text = output_text.split("<|im_start|>")[0]
         resp_text = output_text.strip()
 
+        # The return shape copies the OpenAI chat API, so code written for that API works here.
         return {
             "choices": [{
                 "message": {"role": "assistant", "content": resp_text},
@@ -86,6 +97,8 @@ class GuppyInference:
         }
 
     def _format_prompt(self, messages):
+        # Build the same ChatML text the model saw in training. The prompt ends with an open
+        # "<|im_start|>assistant" line, so the model's natural next step is to write the answer.
         parts = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -96,6 +109,7 @@ class GuppyInference:
 
 
 def main():
+    # Command-line chat. Example: python -m guppylm.inference -p "hi guppy"
     import argparse
     p = argparse.ArgumentParser(description="Chat with Guppy")
     p.add_argument("--checkpoint", default="checkpoints/best_model.pt")
