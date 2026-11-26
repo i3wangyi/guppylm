@@ -470,6 +470,33 @@ for temp in [0.1, 0.7, 1.5, 3.0]:
         print('  ', chat(question, temperature=temp))
 """))
 
+    cells.append(m(r"""
+### Chat with Guppy yourself
+
+Type a message in the box below and press **Enter**. Guppy answers underneath. Each message is separate: Guppy does not remember earlier ones.
+Move the slider to change the temperature and see how the replies change. Ideas to try: "what is your name", "do you like cats", "are you scared of the filter", "what is bitcoin".
+"""))
+    cells.append(c(r"""
+import ipywidgets as widgets
+from IPython.display import display
+
+box = widgets.Text(placeholder='say something to Guppy, then press Enter', layout=widgets.Layout(width='520px'))
+temp_slider = widgets.FloatSlider(value=0.7, min=0.1, max=2.0, step=0.1, description='temperature', style={'description_width': 'initial'})
+log = widgets.Output()
+
+def on_send(_):
+    text = box.value.strip()
+    if not text:
+        return
+    box.value = ''
+    with log:
+        print(f'You>   {text}')
+        print(f'Guppy> {chat(text, temperature=temp_slider.value)}\n')
+
+box.on_submit(on_send)
+display(box, temp_slider, log)
+"""))
+
     # ── 9. Experiments ──────────────────────────────────────────────────
     cells.append(m(r"""
 ## 9. Where to go next
@@ -491,7 +518,7 @@ Training writes into `checkpoints/`. To keep your first model for comparison, re
 !python train.py
 ```
 
-**Keep your model.** The cell below packs the files you need into one archive. Uncomment the last two lines to download it to your computer.
+**Keep your model.** Colab deletes everything in `/content` when the runtime disconnects or times out, and the trained model goes with it. The cell below packs the files you need into one archive. Uncomment the last two lines to download it to your computer.
 """))
     cells.append(c(r"""
 !cd /content && tar czf guppylm.tar.gz guppy/checkpoints/best_model.pt guppy/checkpoints/config.json guppy/data/tokenizer.json guppy/model.py guppy/config.py guppy/inference.py
