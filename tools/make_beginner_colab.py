@@ -42,11 +42,11 @@ So if you understand this notebook, you understand the core of how a chat model 
 **How to run it**
 1. Open the menu **Runtime > Change runtime type** and pick a GPU (see the note below).
 2. Run the cells from top to bottom with **Shift+Enter**. Read the text above each cell first.
-3. Total time: about 5 to 10 minutes.
+3. Total time: about 6 minutes on an L4 GPU (training itself takes about 4.5 minutes).
 
-**Which GPU?** This model is tiny. A big GPU does not make it much faster, because the GPU spends most of its time waiting for small jobs to launch.
-An **L4** is a good pick: it is fast enough, it has plenty of memory, and it costs about half of what an A100 costs in Colab compute units.
-A free **T4** works too, just a little slower.
+**Which GPU?** This model is tiny: 8.7 million parameters and batches of 32 short sentences. It needs very little GPU memory, and a bigger GPU helps less than you might expect, because a lot of each training step goes to Python overhead and launching many small GPU jobs.
+An **L4** is a good pick. It is fast enough (10,000 training steps in about 4.5 minutes) and it uses far fewer Colab compute units per hour than an A100 or H100.
+A free **T4** also works.
 
 **Map of this notebook**
 
@@ -208,7 +208,7 @@ A neural network only understands numbers. A **tokenizer** cuts text into pieces
 
 We use **BPE** (byte-pair encoding). It starts from single characters and keeps merging the pairs that appear most often in the training text. Common words end up as one token, rare words get split into several pieces.
 
-We ask for a vocabulary of 4,096 tokens. Three of them are reserved for special markers: `<pad>` (id 0, filler to make batches the same length), `<|im_start|>` (id 1) and `<|im_end|>` (id 2).
+We ask for a vocabulary of up to 4,096 tokens. Three of them are reserved for special markers: `<pad>` (id 0, filler to make batches the same length), `<|im_start|>` (id 1) and `<|im_end|>` (id 2).
 """))
     cells.append(c(r"""
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, processors
@@ -229,7 +229,10 @@ tokenizer.save('data/tokenizer.json')
 print(f'Vocabulary size: {tokenizer.get_vocab_size()}')
 """))
     cells.append(m(r"""
+**Why is the vocabulary smaller than 4,096?** The fish only talks about a few hundred words. The trainer stops merging when no pair of pieces appears at least twice, so it ends with fewer tokens than the limit. The model still allocates 4,096 slots, and the unused ones just stay untrained. That is why the loss check in step 5 uses 4,096.
+
 Now play with it. Change the sentence and run the cell again. Words the fish knows well (water, food) become one token. Words it has never seen, like "quantum", split into smaller pieces.
+The `Ġ` you see at the start of a token is how this tokenizer writes a leading space, so `Ġlove` means " love".
 """))
     cells.append(c(r"""
 sentence = 'i love food and the water is warm'   # <- try your own sentence
@@ -377,7 +380,7 @@ plt.xlabel('step'); plt.ylabel('learning rate'); plt.title('Warmup, then cosine 
 plt.show()
 """))
     cells.append(m(r"""
-Now run the training. It prints a row every 100 steps. Watch the `Train` column fall from about 8.3 toward 1 or lower, and watch the `Eval` column follow it.
+Now run the training. It takes about 4.5 minutes on an L4. It prints a row every 100 steps. Watch the `Train` column fall from about 8.3 to about 0.4, and watch the `Eval` column follow it.
 """))
     cells.append(c(r"""
 del model          # free the GPU memory used by the untrained model from step 5
@@ -403,6 +406,9 @@ plt.plot(smooth(losses), label='average of last 100 steps')
 plt.xlabel('step'); plt.ylabel('training loss'); plt.legend(); plt.title('Training loss')
 plt.show()
 print(f'First loss: {losses[0]:.3f}   Last loss: {losses[-1]:.3f}')
+"""))
+    cells.append(m(r"""
+The loss drops steeply in the first 1,000 steps, then flattens around 0.4. It does not reach 0 because one question has many valid answers in the data ("are you hungry" has dozens of different replies), so the model cannot predict the exact next word every time. It only needs to give good odds to each valid one.
 """))
 
     # ── 8. Generation ───────────────────────────────────────────────────
@@ -451,14 +457,14 @@ for p, i in zip(top.values, top.indices):
 
 - Low (0.1): the likeliest token almost always wins. Safe and repetitive.
 - Medium (0.7): a good mix. This is the default.
-- High (1.5): unlikely tokens get a real chance. More surprising, and more nonsense.
+- High (1.5 and up): unlikely tokens get a real chance. More surprising, and eventually nonsense.
 
-Run the cell a few times. The low-temperature answers barely change, the high-temperature answers jump around.
+Run the cell a few times. The 0.1 answers barely change. This model is small and its data is narrow, so even 1.5 stays fairly readable. Try 3.0 to see it fall apart.
 """))
     cells.append(c(r"""
 question = 'what do you think about the rain'   # <- try your own question
 
-for temp in [0.1, 0.7, 1.5]:
+for temp in [0.1, 0.7, 1.5, 3.0]:
     print(f'--- temperature {temp} ---')
     for _ in range(3):
         print('  ', chat(question, temperature=temp))
@@ -476,9 +482,12 @@ You trained a language model from raw text. The only difference between this and
 4. **Change the learning rate.** Try `learning_rate = 3e-2` (100x too big). What happens to the loss?
 5. **Ask it something it never saw.** "What is bitcoin?" Guppy was trained on fish topics only, so see what it makes up.
 
-To edit a file in Colab, open the folder icon on the left, go to `guppy/`, and double-click the file. Training in a fresh process picks up your edit:
+To edit a file in Colab, open the folder icon on the left, go to `guppy/`, and double-click the file. Do not re-run the `%%writefile` cells afterwards, because they would overwrite your edit.
+
+Training writes into `checkpoints/`. To keep your first model for comparison, rename the folder first, then train again in a fresh process so it picks up your edit:
 
 ```
+!mv checkpoints checkpoints_run1
 !python train.py
 ```
 
